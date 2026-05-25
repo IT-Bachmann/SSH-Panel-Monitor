@@ -66,8 +66,13 @@ Ein selbst gehostetes Webpanel zur zentralen Verwaltung von SSH-Servern mit Benu
 bash
 # SH-Datei herunterladen und ausführbar machen
 
+wget https://raw.githubusercontent.com/IT-Bachmann/SSH-Panel-Monitor/main/install-remote-ssh-panel.sh
 
 chmod +x install-remote-ssh-panel.sh
 
 # Als root ausführen
 sudo ./install-remote-ssh-panel.sh
+
+# schnelle Installation
+
+curl -sSL https://raw.githubusercontent.com/IT-Bachmann/SSH-Panel-Monitor/main/install-remote-ssh-panel.sh | sudo bash
