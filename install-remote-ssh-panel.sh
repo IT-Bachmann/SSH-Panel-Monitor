@@ -372,7 +372,6 @@ const io = new Server(server, { cors: { origin: "*" } });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// KORRIGIERTE SESSION KONFIGURATION
 app.use(session({
     secret: 'remote-panel-secret-key-' + Date.now(),
     resave: true,
@@ -805,7 +804,7 @@ app.get('/api/monitoring/:id', async (req, res) => {
     });
 });
 
-// ==================== WEBSOCKET SSH MIT RESIZE UNTERSTÜTZUNG ====================
+// ==================== WEBSOCKET SSH ====================
 const sshSessions = new Map();
 
 io.on('connection', (socket) => {
@@ -827,15 +826,13 @@ io.on('connection', (socket) => {
                 const ssh = new Client();
                 ssh.on('ready', () => {
                     connected = true;
-                    sshSessions.set(sessionId, { ssh, socketId: socket.id, tabId, serverName });
-                    socket.emit('sessionCreated', { sessionId, tabId, serverName });
-                    socket.emit('output', { sessionId, tabId, data: `\r\n[OK] Verbunden!\r\n` });
-                    
-                    // Shell mit Terminalgröße
-                    const termRows = rows || 40;
-                    const termCols = cols || 120;
+                    const termRows = rows || 80;
+                    const termCols = cols || 160;
                     ssh.shell({ term: 'xterm-256color', cols: termCols, rows: termRows }, (err, stream) => {
                         if (err) { socket.emit('output', { sessionId, tabId, data: `\r\n[ERROR] Shell: ${err.message}\r\n` }); return; }
+                        sshSessions.set(sessionId, { ssh, stream, socketId: socket.id, tabId, serverName });
+                        socket.emit('sessionCreated', { sessionId, tabId, serverName });
+                        socket.emit('output', { sessionId, tabId, data: `\r\n[OK] Verbunden!\r\n` });
                         stream.on('data', (d) => { socket.emit('output', { sessionId, tabId, data: d.toString() }); });
                         stream.on('close', () => { socket.emit('output', { sessionId, tabId, data: `\r\n[CLOSED] Verbindung beendet\r\n` }); sshSessions.delete(sessionId); });
                         socket.on('input', (input) => { if (input.sessionId === sessionId && stream.writable) stream.write(input.data); });
@@ -854,13 +851,24 @@ io.on('connection', (socket) => {
         if (!connected) socket.emit('output', { sessionId, tabId, data: `\r\n[FAIL] Alle Verbindungsversuche fehlgeschlagen!\r\n` });
     });
     
-    socket.on('closeTab', (data) => { const session = sshSessions.get(data.sessionId); if (session && session.ssh) { session.ssh.end(); sshSessions.delete(data.sessionId); socket.emit('tabClosed', data); } });
+    socket.on('closeTab', (data) => { 
+        const session = sshSessions.get(data.sessionId); 
+        if (session && session.ssh) { 
+            session.ssh.end(); 
+            sshSessions.delete(data.sessionId); 
+            socket.emit('tabClosed', data); 
+        } 
+    });
     
-    // TERMINAL RESIZE EVENT
+    // TERMINAL RESIZE EVENT - KORRIGIERT
     socket.on('resize', (data) => {
         const session = sshSessions.get(data.sessionId);
-        if (session && session.ssh) {
-            session.ssh.setWindow(data.rows, data.cols);
+        if (session && session.stream) {
+            try {
+                session.stream.setWindow(data.rows, data.cols, data.cols * 9, data.rows * 17);
+            } catch (e) {
+                console.log('Resize error:', e.message);
+            }
         }
     });
 });
@@ -1149,8 +1157,8 @@ body{background:#0f0f1a;font-family:Arial,sans-serif;color:#e2e8f0;overflow:hidd
 .tab:hover{background:#2a2a3a}
 .tab-close{background:none;border:none;color:#94a3b8;cursor:pointer;padding:0 3px;border-radius:3px}
 .tab-close:hover{background:#ef4444;color:white}
-.terminal-wrapper{flex:1;position:relative;background:#0d1117;min-height:800px}
-.terminal-pane{display:none;width:100%;height:100%;min-height:800px}
+.terminal-wrapper{flex:1;position:relative;background:#0d1117;min-height:600px,height: calc(100vh - 120px);}
+.terminal-pane{display:none;width:100%;height:100%;min-height:600px}
 .terminal-pane.active{display:block}
 .xterm{height:100% !important}
 .xterm-viewport{height:100% !important}
@@ -1500,20 +1508,34 @@ function createSSHTab(server) {
         theme: { background: '#0d1117', foreground: '#e2e8f0' },
         fontSize: 14,
         fontFamily: 'monospace',
-        rows: 80,
-        cols: 160,
-        scrollback: 10000
+        rows: 55,
+        cols: 180,
+        scrollback: 10000,
+        convertEol: true,
+        allowProposedApi: true,
+        windowsMode: false
     });
     
     const fitAddon = new FitAddon.FitAddon();
     term.loadAddon(fitAddon);
     term.open(termDiv);
-    setTimeout(() => fitAddon.fit(), 100);
+    
+    // Terminal an Container anpassen
+    setTimeout(() => {
+        fitAddon.fit();
+        term.focus();
+    }, 200);
+    
+    // Bei Fenstergrößenänderung
     window.addEventListener('resize', () => {
-        if(activeTabId === tabId) fitAddon.fit();
         const td = tabs.get(tabId);
-        if(td && td.sessionId) {
-            socket.emit('resize', { sessionId: td.sessionId, rows: term.rows, cols: term.cols });
+        fitAddon.fit();
+        if (td && td.sessionId) {
+            socket.emit('resize', { 
+                sessionId: td.sessionId, 
+                cols: term.cols, 
+                rows: term.rows 
+            });
         }
     });
     
@@ -1556,8 +1578,18 @@ function createSSHTab(server) {
     const sessionHandler = (data) => {
         if(data.tabId === tabId) {
             const td = tabs.get(tabId);
-            if(td) td.sessionId = data.sessionId;
-            fitAddon.fit();
+            if(td) {
+                td.sessionId = data.sessionId;
+                term.write(`\r\n\x1b[32m Verbunden\x1b[0m\r\n`);
+                setTimeout(() => {
+                    fitAddon.fit();
+                    socket.emit('resize', { 
+                        sessionId: data.sessionId, 
+                        cols: term.cols, 
+                        rows: term.rows 
+                    });
+                }, 100);
+            }
         }
     };
     
@@ -1566,13 +1598,19 @@ function createSSHTab(server) {
     
     term.onData((data) => {
         const td = tabs.get(tabId);
-        if(td && td.sessionId) socket.emit('input', { sessionId: td.sessionId, data: data });
+        if(td && td.sessionId) {
+            socket.emit('input', { sessionId: td.sessionId, data: data });
+        }
     });
     
     term.onResize((size) => {
         const td = tabs.get(tabId);
         if(td && td.sessionId) {
-            socket.emit('resize', { sessionId: td.sessionId, rows: size.rows, cols: size.cols });
+            socket.emit('resize', { 
+                sessionId: td.sessionId, 
+                cols: size.cols, 
+                rows: size.rows 
+            });
         }
     });
     
