@@ -371,12 +371,21 @@ const io = new Server(server, { cors: { origin: "*" } });
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+
+// KORRIGIERTE SESSION KONFIGURATION
 app.use(session({
-    secret: 'remote-panel-secret-key-2024',
-    resave: false,
-    saveUninitialized: false,
-    cookie: { maxAge: 3600000 }
+    secret: 'remote-panel-secret-key-' + Date.now(),
+    resave: true,
+    saveUninitialized: true,
+    cookie: { 
+        maxAge: 3600000,
+        httpOnly: true,
+        secure: false,
+        sameSite: 'lax'
+    },
+    name: 'remote-panel-sid'
 }));
+
 app.use(express.static('/opt/remote-panel/frontend'));
 
 const db = mysql.createConnection({
@@ -796,11 +805,12 @@ app.get('/api/monitoring/:id', async (req, res) => {
     });
 });
 
-// ==================== WEBSOCKET SSH ====================
+// ==================== WEBSOCKET SSH MIT RESIZE UNTERSTÜTZUNG ====================
 const sshSessions = new Map();
+
 io.on('connection', (socket) => {
     socket.on('connectSSH', async (data) => {
-        const { serverId, serverName, hostname, ipv4_host, ipv6_host, port, username, password, sshKeyName, tabId, preferIPv6 } = data;
+        const { serverId, serverName, hostname, ipv4_host, ipv6_host, port, username, password, sshKeyName, tabId, preferIPv6, cols, rows } = data;
         const sessionId = uuidv4();
         let sshKeyContent = await getValidKey(sshKeyName);
         const hostsToTry = [];
@@ -820,7 +830,11 @@ io.on('connection', (socket) => {
                     sshSessions.set(sessionId, { ssh, socketId: socket.id, tabId, serverName });
                     socket.emit('sessionCreated', { sessionId, tabId, serverName });
                     socket.emit('output', { sessionId, tabId, data: `\r\n[OK] Verbunden!\r\n` });
-                    ssh.shell((err, stream) => {
+                    
+                    // Shell mit Terminalgröße
+                    const termRows = rows || 40;
+                    const termCols = cols || 120;
+                    ssh.shell({ term: 'xterm-256color', cols: termCols, rows: termRows }, (err, stream) => {
                         if (err) { socket.emit('output', { sessionId, tabId, data: `\r\n[ERROR] Shell: ${err.message}\r\n` }); return; }
                         stream.on('data', (d) => { socket.emit('output', { sessionId, tabId, data: d.toString() }); });
                         stream.on('close', () => { socket.emit('output', { sessionId, tabId, data: `\r\n[CLOSED] Verbindung beendet\r\n` }); sshSessions.delete(sessionId); });
@@ -839,7 +853,16 @@ io.on('connection', (socket) => {
         }
         if (!connected) socket.emit('output', { sessionId, tabId, data: `\r\n[FAIL] Alle Verbindungsversuche fehlgeschlagen!\r\n` });
     });
+    
     socket.on('closeTab', (data) => { const session = sshSessions.get(data.sessionId); if (session && session.ssh) { session.ssh.end(); sshSessions.delete(data.sessionId); socket.emit('tabClosed', data); } });
+    
+    // TERMINAL RESIZE EVENT
+    socket.on('resize', (data) => {
+        const session = sshSessions.get(data.sessionId);
+        if (session && session.ssh) {
+            session.ssh.setWindow(data.rows, data.cols);
+        }
+    });
 });
 
 // ==================== SSL MANAGER ====================
@@ -1108,7 +1131,7 @@ cat > /opt/remote-panel/frontend/index.html << 'EOF'
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0f0f1a;font-family:Arial,sans-serif;color:#e2e8f0;overflow:hidden}
 .app{display:flex;height:100vh}
-.sidebar{width:300px;background:#0a0a0f;border-right:1px solid #1e1e2e;display:flex;flex-direction:column;overflow-y:auto;flex-shrink:0}
+.sidebar{width:400px;background:#0a0a0f;border-right:1px solid #1e1e2e;display:flex;flex-direction:column;overflow-y:auto;flex-shrink:0}
 .sidebar-header{padding:16px;border-bottom:1px solid #1e1e2e;font-size:18px;font-weight:bold}
 .nav-item{padding:10px 16px;margin:4px 12px;border-radius:10px;cursor:pointer}
 .nav-item:hover{background:#1e1e2e}
@@ -1126,9 +1149,11 @@ body{background:#0f0f1a;font-family:Arial,sans-serif;color:#e2e8f0;overflow:hidd
 .tab:hover{background:#2a2a3a}
 .tab-close{background:none;border:none;color:#94a3b8;cursor:pointer;padding:0 3px;border-radius:3px}
 .tab-close:hover{background:#ef4444;color:white}
-.terminal-wrapper{flex:1;position:relative;background:#0d1117}
-.terminal-pane{display:none;width:100%;height:100%}
+.terminal-wrapper{flex:1;position:relative;background:#0d1117;min-height:800px}
+.terminal-pane{display:none;width:100%;height:100%;min-height:800px}
 .terminal-pane.active{display:block}
+.xterm{height:100% !important}
+.xterm-viewport{height:100% !important}
 .content-panel{display:none;padding:16px;overflow-y:auto;height:100%}
 .content-panel.active{display:block}
 .card{background:#1e1e2e;border-radius:14px;padding:20px;margin-bottom:16px;border:1px solid #2a2a3a}
@@ -1186,7 +1211,6 @@ th,td{padding:8px;text-align:left;border-bottom:1px solid #2a2a3a}
         <div class="nav-item" data-panel="2fa">2FA</div>
         <div class="nav-item" data-panel="logout">Logout</div>
         
-        <!-- Add Server Section -->
         <div class="add-server-section">
             <h4>+ Server hinzufuegen</h4>
             <input type="hidden" id="edit-id" value="">
@@ -1209,7 +1233,6 @@ th,td{padding:8px;text-align:left;border-bottom:1px solid #2a2a3a}
             </div>
         </div>
         
-        <!-- Servers List Section -->
         <div class="servers-section">
             <h4>Meine Server</h4>
             <div id="servers-list"></div>
@@ -1382,8 +1405,7 @@ async function listCertificates() {
     } else {
         certs.forEach(c => {
             html += `<tr>
-                <td>${escapeHtml(c.domain)}</td>
-                <td>${escapeHtml(c.issuer || 'Unknown')}</td>
+                <td>${escapeHtml(c.domain)}</td><td>${escapeHtml(c.issuer || 'Unknown')}</td>
                 <td>${c.expires_at ? new Date(c.expires_at).toLocaleDateString() : '-'}</td>
                 <td><button class="btn-primary" onclick="configureSSL('${c.domain}')" style="padding:4px 8px;font-size:11px">Nginx konfigurieren</button></td>
             </tr>`;
@@ -1462,7 +1484,101 @@ function cancelEdit(){currentEditId=null;document.getElementById('edit-id').valu
 
 function editServer(id){const s=servers.find(s=>s.id===id);if(!s)return;currentEditId=id;document.getElementById('edit-id').value=id;document.getElementById('srv-name').value=s.name;document.getElementById('srv-hostname').value=s.hostname||'';document.getElementById('srv-ipv4').value=s.ipv4_host||'';document.getElementById('srv-ipv6').value=s.ipv6_host||'';document.getElementById('srv-port').value=s.port;document.getElementById('srv-user').value=s.username;document.getElementById('srv-pass').value=s.password||'';document.getElementById('srv-sshkey-select').value=s.ssh_key_name||'';document.getElementById('srv-prefer-ipv6').checked=s.prefer_ipv6===1}
 
-function createSSHTab(server){const tabId=`tab-${nextTabId++}`;const terminalId=`term-${tabId}`;const wrapper=document.getElementById('terminal-wrapper');const termDiv=document.createElement('div');termDiv.id=terminalId;termDiv.className='terminal-pane';termDiv.style.height='100%';wrapper.appendChild(termDiv);const term=new Terminal({cursorBlink:true,theme:{background:'#0d1117',foreground:'#e2e8f0'},fontSize:13});const fitAddon=new FitAddon.FitAddon();term.loadAddon(fitAddon);term.open(termDiv);setTimeout(()=>fitAddon.fit(),100);window.addEventListener('resize',()=>{if(activeTabId===tabId)fitAddon.fit()});const tabsContainer=document.getElementById('tabs-container');const tab=document.createElement('div');tab.className='tab';tab.id=tabId;tab.innerHTML=`<span>T</span><span>${escapeHtml(server.name)}</span><button class="tab-close" onclick="event.stopPropagation(); closeTab('${tabId}')">x</button>`;tab.onclick=()=>switchToTab(tabId);tabsContainer.appendChild(tab);tabs.set(tabId,{term,fitAddon,sessionId:null,serverName:server.name});term.write(`\r\n=== ${server.name} ===\r\n`);term.write(`User: ${server.username}\r\n`);if(server.hostname)term.write(`Host: ${server.hostname}\r\n`);socket.emit('connectSSH',{serverId:server.id,serverName:server.name,hostname:server.hostname||'',ipv4_host:server.ipv4_host||'',ipv6_host:server.ipv6_host||'',port:server.port,username:server.username,password:server.password,sshKeyName:server.ssh_key_name,tabId:tabId,preferIPv6:server.prefer_ipv6===1});const outputHandler=(data)=>{if(data.tabId===tabId)term.write(data.data)};const sessionHandler=(data)=>{if(data.tabId===tabId){const td=tabs.get(tabId);if(td)td.sessionId=data.sessionId;fitAddon.fit()}};socket.on('output',outputHandler);socket.on('sessionCreated',sessionHandler);term.onData((data)=>{const td=tabs.get(tabId);if(td&&td.sessionId)socket.emit('input',{sessionId:td.sessionId,data:data})});tabs.get(tabId).eventHandlers={outputHandler,sessionHandler};switchToTab(tabId)}
+function createSSHTab(server) {
+    const tabId = `tab-${nextTabId++}`;
+    const terminalId = `term-${tabId}`;
+    
+    const wrapper = document.getElementById('terminal-wrapper');
+    const termDiv = document.createElement('div');
+    termDiv.id = terminalId;
+    termDiv.className = 'terminal-pane';
+    termDiv.style.height = '100%';
+    wrapper.appendChild(termDiv);
+    
+    const term = new Terminal({
+        cursorBlink: true,
+        theme: { background: '#0d1117', foreground: '#e2e8f0' },
+        fontSize: 14,
+        fontFamily: 'monospace',
+        rows: 80,
+        cols: 160,
+        scrollback: 10000
+    });
+    
+    const fitAddon = new FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(termDiv);
+    setTimeout(() => fitAddon.fit(), 100);
+    window.addEventListener('resize', () => {
+        if(activeTabId === tabId) fitAddon.fit();
+        const td = tabs.get(tabId);
+        if(td && td.sessionId) {
+            socket.emit('resize', { sessionId: td.sessionId, rows: term.rows, cols: term.cols });
+        }
+    });
+    
+    const tabsContainer = document.getElementById('tabs-container');
+    const tab = document.createElement('div');
+    tab.className = 'tab';
+    tab.id = tabId;
+    tab.innerHTML = `<span>T</span><span>${escapeHtml(server.name)}</span><button class="tab-close" onclick="event.stopPropagation(); closeTab('${tabId}')">x</button>`;
+    tab.onclick = () => switchToTab(tabId);
+    tabsContainer.appendChild(tab);
+    
+    tabs.set(tabId, { term, fitAddon, sessionId: null, serverName: server.name });
+    
+    term.write(`\r\n=== ${server.name} ===\r\n`);
+    term.write(`User: ${server.username}\r\n`);
+    if(server.hostname) term.write(`Host: ${server.hostname}\r\n`);
+    if(server.ipv4_host) term.write(`IPv4: ${server.ipv4_host}\r\n`);
+    if(server.ipv6_host) term.write(`IPv6: ${server.ipv6_host}\r\n`);
+    
+    socket.emit('connectSSH', {
+        serverId: server.id,
+        serverName: server.name,
+        hostname: server.hostname || '',
+        ipv4_host: server.ipv4_host || '',
+        ipv6_host: server.ipv6_host || '',
+        port: server.port,
+        username: server.username,
+        password: server.password,
+        sshKeyName: server.ssh_key_name,
+        tabId: tabId,
+        preferIPv6: server.prefer_ipv6 === 1,
+        cols: term.cols,
+        rows: term.rows
+    });
+    
+    const outputHandler = (data) => {
+        if(data.tabId === tabId) term.write(data.data);
+    };
+    
+    const sessionHandler = (data) => {
+        if(data.tabId === tabId) {
+            const td = tabs.get(tabId);
+            if(td) td.sessionId = data.sessionId;
+            fitAddon.fit();
+        }
+    };
+    
+    socket.on('output', outputHandler);
+    socket.on('sessionCreated', sessionHandler);
+    
+    term.onData((data) => {
+        const td = tabs.get(tabId);
+        if(td && td.sessionId) socket.emit('input', { sessionId: td.sessionId, data: data });
+    });
+    
+    term.onResize((size) => {
+        const td = tabs.get(tabId);
+        if(td && td.sessionId) {
+            socket.emit('resize', { sessionId: td.sessionId, rows: size.rows, cols: size.cols });
+        }
+    });
+    
+    tabs.get(tabId).eventHandlers = { outputHandler, sessionHandler };
+    switchToTab(tabId);
+}
 
 function switchToTab(tabId){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.terminal-pane').forEach(p=>p.classList.remove('active'));document.getElementById(tabId)?.classList.add('active');document.getElementById(`term-${tabId}`)?.classList.add('active');const td=tabs.get(tabId);if(td&&td.fitAddon)setTimeout(()=>td.fitAddon.fit(),100);activeTabId=tabId}
 
@@ -1487,7 +1603,7 @@ async function loadServers(){const r=await fetch('/api/servers');servers=await r
             </div>
         </div>
     </div>
-</div>`});document.getElementById('servers-list').innerHTML=sidebarHtml||'Keine Server';let tableHtml='<table style="width:100%"><thead><th>Name</th><th>Hosts</th><th>Port</th><th>Status</th><th>Aktion</th></tr></thead><tbody>';servers.forEach(s=>{const hosts=[s.hostname,s.ipv4_host,s.ipv6_host].filter(h=>h).join(', ')||'-';const statusHtml=s.last_status?getStatusBadge(s.last_status,s.last_ping_ms):'-';tableHtml+=`<tr><td><strong>${escapeHtml(s.name)}</strong></td><td><small>${escapeHtml(hosts)}</small></td><td>${s.port}</td><td>${statusHtml}</td><td><button class="btn-edit" onclick="editServer(${s.id})">Ed</button><button class="btn-delete" onclick="deleteServer(${s.id})">Del</button><button class="btn-primary" onclick="connectServer(${s.id})" style="padding:2px 6px">Conn</button></td></tr>`});tableHtml+='</tbody></table>';document.getElementById('servers-table').innerHTML=tableHtml||'<div>Keine Server</div>';let opt='<option value="">-- Server --</option>';servers.forEach(s=>opt+=`<option value="${s.id}">${escapeHtml(s.name)}</option>`);document.getElementById('monitor-server').innerHTML=opt}
+</div>`});document.getElementById('servers-list').innerHTML=sidebarHtml||'Keine Server';let tableHtml='<table style="width:100%"><thead><tr><th>Name</th><th>Hosts</th><th>Port</th><th>Status</th><th>Aktion</th></tr></thead><tbody>';servers.forEach(s=>{const hosts=[s.hostname,s.ipv4_host,s.ipv6_host].filter(h=>h).join(', ')||'-';const statusHtml=s.last_status?getStatusBadge(s.last_status,s.last_ping_ms):'-';tableHtml+=`<tr><td><strong>${escapeHtml(s.name)}</strong></td><td><small>${escapeHtml(hosts)}</small></td><td>${s.port}</td><td>${statusHtml}</td><td><button class="btn-edit" onclick="editServer(${s.id})">Ed</button><button class="btn-delete" onclick="deleteServer(${s.id})">Del</button><button class="btn-primary" onclick="connectServer(${s.id})" style="padding:2px 6px">Conn</button></td></tr>`});tableHtml+='</tbody></table>';document.getElementById('servers-table').innerHTML=tableHtml||'<div>Keine Server</div>';let opt='<option value="">-- Server --</option>';servers.forEach(s=>opt+=`<option value="${s.id}">${escapeHtml(s.name)}</option>`);document.getElementById('monitor-server').innerHTML=opt}
 
 function loadMonitorServers(){loadServers()}
 
@@ -1511,7 +1627,10 @@ async function viewKey(n){const r=await fetch('/api/ssh-keys/'+n);const d=await 
 async function deleteKey(n){if(confirm('Key loeschen?')){await fetch('/api/ssh-keys/'+n,{method:'DELETE'});loadKeys()}}
 
 // ==================== BENUTZER ====================
-async function loadUsers(){const r=await fetch('/api/users');const u=await r.json();let h='<table style="width:100%"><thead><th>Benutzer</th><th>Rolle</th><th>2FA</th><th>Aktion</th></tr></thead><tbody>';u.forEach(u=>{h+=`<tr><td>${escapeHtml(u.username)}</td><td>${u.role}</td><td>${u.totp_enabled?'Aktiv':'Inaktiv'}</td>}<td><button onclick="deleteUser(${u.id})" style="background:#ef4444;border:none;padding:3px 8px;border-radius:4px;cursor:pointer">Del</button></td></tr>`});h+='</tbody></table>';document.getElementById('users-list').innerHTML=h}
+async function loadUsers(){const r=await fetch('/api/users');const u=await r.json();let h='<table style="width:100%"><thead><th>Benutzer</th><th>Rolle</th><th>2FA</th><th>Aktion</th></tr></thead><tbody>';u.forEach(u=>{h+=`<tr><td>${escapeHtml(u.username)}</td><td>${u.role}</td>
+                <td>${u.totp_enabled?'Aktiv':'Inaktiv'}</td>
+                <td><button onclick="deleteUser(${u.id})" style="background:#ef4444;border:none;padding:3px 8px;border-radius:4px;cursor:pointer">Del</button></td>
+            </tr>`});h+='</tbody></table>';document.getElementById('users-list').innerHTML=h}
 
 async function addUser(){const u=document.getElementById('user-name').value,p=document.getElementById('user-pass').value,r=document.getElementById('user-role').value;if(!u||!p){alert('Benutzername und Passwort Pflicht!');return}await fetch('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p,role:r})});alert('Benutzer erstellt');loadUsers()}
 
@@ -1578,7 +1697,7 @@ ufw allow 22/tcp 2>/dev/null || true
 clear
 echo ""
 echo "================================================================================"
-echo "     REMOTE PANEL - MIT 2FA + SSL MANAGER"
+echo "     REMOTE PANEL - MIT 2FA + SSL MANAGER + TERMINAL RESIZE"
 echo "================================================================================"
 echo ""
 echo "Web: http://$(hostname -I | awk '{print $1}')"
